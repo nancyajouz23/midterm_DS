@@ -1,0 +1,175 @@
+
+services:
+  repair-worker:
+    build:
+      context: .
+      dockerfile: repair_worker/Dockerfile
+    environment:
+      METADATA_URL: http://metadata:8010
+      REPAIR_INTERVAL: "10"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+  storage-node-5:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-5
+    ports:
+      - "8005:8000"
+    environment:
+      NODE_ID: node5
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node5-data:/data
+    depends_on:
+      - metadata
+
+  storage-node-6:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-6
+    ports:
+      - "8006:8000"
+    environment:
+      NODE_ID: node6
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node6-data:/data
+    depends_on:
+      - metadata
+
+  storage-node-1:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-1
+    ports:
+      - "8001:8000"
+    environment:
+      NODE_ID: node1
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node1-data:/data
+    depends_on:
+      - metadata
+
+  storage-node-2:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-2
+    ports:
+      - "8002:8000"
+    environment:
+      NODE_ID: node2
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node2-data:/data
+    depends_on:
+      - metadata
+
+  storage-node-3:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-3
+    ports:
+      - "8003:8000"
+    environment:
+      NODE_ID: node3
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node3-data:/data
+    depends_on:
+      - metadata
+
+  storage-node-4:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-4
+    ports:
+      - "8004:8000"
+    environment:
+      NODE_ID: node4
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node4-data:/data
+    depends_on:
+      - metadata
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ds_storage
+      POSTGRES_USER: ds_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - metadata-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ds_user -d ds_storage"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  metadata:
+    build:
+      context: .
+      dockerfile: metadata_service/Dockerfile
+    ports:
+      - "8010:8010"
+    environment:
+      DATABASE_URL: postgresql://ds_user:${POSTGRES_PASSWORD}@postgres:5432/ds_storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "8020:8020"
+    environment:
+      METADATA_URL: http://metadata:8010
+      DATABASE_URL: postgresql://ds_user:${POSTGRES_PASSWORD}@postgres:5432/ds_storage
+      API_KEY: ${GATEWAY_API_KEY}
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+volumes:
+  node1-data:
+    external: true
+    name: ds-midterm-node1-data
+
+  node2-data:
+    external: true
+    name: ds-midterm-node2-data
+
+  node3-data:
+    external: true
+    name: ds-midterm-node3-data
+
+  node4-data:
+    external: true
+    name: ds-midterm-node4-data
+
+  metadata-db:
+
+  node5-data:
+    external: true
+    name: ds-midterm-node5-data
+
+  node6-data:
+    external: true
+    name: ds-midterm-node6-data

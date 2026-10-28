@@ -1,0 +1,30 @@
+{
+  "bucket": "replication-test-a7c0db9b",
+  "key": "replicated-demo.bin",
+  "original_sha256": "466d0d19231cdb85c5a65df6b5a3a5e4cc150df03f7f506e85b915d83a38c900",
+  "replication_factor": 3,
+  "write_quorum": 2,
+  "read_quorum": 2,
+  "replica_locations": {
+    "72d30f6ccd9a9cd5759133d4c62f3cb6ee6e6aeb48b9330ab2b872e561699373": [
+      "node1",
+      "node2",
+      "node3"
+    ],
+    "cc277bf78a88f33dfaf1cfdcd4b98624052bc32de7dc126f15f40730cd23c009": [
+      "node3",
+      "node2",
+      "node1"
+    ],
+    "415b5030f25531d912e148441cc7aa2d7215b32c6e6cbb67f642e6235f72fa43": [
+      "node3",
+      "node1",
+      "node4"
+    ],
+    "546e0de70f012ca7410544341973b7d3a3d41ae1db103e8f43f9e003d23dea2e": [
+      "node1",
+      "node2",
+      "node4"
+    ]
+  }
+}

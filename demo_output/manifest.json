@@ -1,0 +1,22 @@
+{
+  "file_name": "original.bin",
+  "file_size": 10485883,
+  "chunk_size": 4194304,
+  "chunks": [
+    {
+      "index": 1,
+      "hash": "311cd0d96db66e938fbae35974bc99c371976740143728acf6b635036b8c3a2a",
+      "size": 4194304
+    },
+    {
+      "index": 2,
+      "hash": "470ce51bdb9176f5df5d2ba90fcae01142f0eca1e6118ec6c4d5e7672c7bcd9a",
+      "size": 4194304
+    },
+    {
+      "index": 3,
+      "hash": "6750b573e6a597d7c1b46b2442f6eba7ca1f44708c8dbc683623afac3a611149",
+      "size": 2097275
+    }
+  ]
+}
