@@ -25,7 +25,12 @@ from zfec.easyfec import Encoder, Decoder
 
 from metadata_service.chunking import fixed_size_chunks
 from metadata_service.placement import ConsistentHashRing
-
+from gateway.search_index import (
+    index_object,
+    remove_object,
+    reindex_all,
+    search_index
+)
 
 METADATA_URL = os.getenv("METADATA_URL", "http://metadata:8010")
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -306,6 +311,20 @@ def store_file(file_path, bucket, key, tags):
                             bucket, key, version, position,
                             index, node, digest, size, padlen
                         ))
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT bucket, object_key, version,
+                       size, tags, created_at
+                FROM objects
+                WHERE bucket=%s AND object_key=%s AND version=%s
+            """, (bucket, key, version))
+            indexed_obj = cur.fetchone()
+
+    try:
+        index_object(indexed_obj)
+    except Exception as exc:
+        print(f"Elasticsearch indexing pending: {exc}", flush=True)
 
     return {
         "bucket": bucket,
@@ -549,6 +568,10 @@ def delete_object(bucket: str, key: str, version: int | None = None):
             f"/objects/metadata/{bucket}/{key}"
             f"/versions/{obj['version']}"
         )
+    try:
+        remove_object(bucket, key, obj["version"])
+    except Exception as exc:
+        print(f"Elasticsearch deletion pending: {exc}", flush=True)
 
     return {
         "deleted": True,
@@ -681,6 +704,34 @@ def cluster_status():
 @app.get("/health")
 def health():
     return {"status": "healthy", "service": "gateway"}
+
+
+@router.post("/search/reindex")
+def reindex_elasticsearch():
+    try:
+        return reindex_all()
+    except Exception as exc:
+        raise HTTPException(503, f"Elasticsearch unavailable: {exc}")
+
+
+@router.get("/search/elasticsearch")
+def search_elasticsearch(
+    bucket: str | None = None,
+    prefix: str = "",
+    min_size: int | None = None,
+    max_size: int | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    tag_key: str | None = None,
+    tag_value: str | None = None
+):
+    try:
+        return search_index(
+            bucket, prefix, min_size, max_size,
+            created_after, created_before, tag_key, tag_value
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"Elasticsearch search failed: {exc}")
 
 
 app.include_router(router)
