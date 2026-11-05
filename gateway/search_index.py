@@ -57,7 +57,8 @@ def index_object(obj):
         response = client.put(
             f"{ES_URL}/{INDEX}/_doc/"
             f"{document_id(obj['bucket'], obj['object_key'], obj['version'])}",
-            params={"refresh": "wait_for"},
+            # No wait_for: the index refreshes within ~1 s, which keeps
+            # uploads fast for workloads with thousands of small files.
             json=serialize_object(obj)
         )
         response.raise_for_status()

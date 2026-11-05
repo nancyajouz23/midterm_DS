@@ -12,6 +12,10 @@ app = FastAPI(title="Distributed Storage Metadata Service")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Nodes send a heartbeat every 5 s; a node that misses three in a row
+# (no heartbeat for 15 s) is considered failed.
+HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "15"))
+
 
 def connect():
     return psycopg2.connect(DATABASE_URL)
@@ -89,6 +93,63 @@ def initialize_database():
                 )
             """)
 
+            # Erasure-coded shard placement (written by the gateway,
+            # relocated by the repair worker).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS erasure_shards (
+                    bucket TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    shard_index INTEGER NOT NULL,
+                    node_id TEXT NOT NULL,
+                    shard_hash VARCHAR(64) NOT NULL,
+                    shard_size BIGINT NOT NULL,
+                    padlen INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        bucket, object_key, version,
+                        position, shard_index
+                    ),
+                    FOREIGN KEY (bucket, object_key, version)
+                        REFERENCES objects(bucket, object_key, version)
+                        ON DELETE CASCADE
+                )
+            """)
+
+            # Repair jobs: one per repair round that found damage,
+            # with progress counters and repair traffic.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS repair_jobs (
+                    job_id SERIAL PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    failed_nodes TEXT[] NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'running',
+                    chunks_total INTEGER NOT NULL DEFAULT 0,
+                    chunks_repaired INTEGER NOT NULL DEFAULT 0,
+                    chunks_failed INTEGER NOT NULL DEFAULT 0,
+                    bytes_read BIGINT NOT NULL DEFAULT 0,
+                    bytes_written BIGINT NOT NULL DEFAULT 0,
+                    started_at TIMESTAMPTZ DEFAULT NOW(),
+                    finished_at TIMESTAMPTZ
+                )
+            """)
+
+            # Per-chunk repair traffic, used to compare replication
+            # and erasure coding per bucket.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS repair_events (
+                    event_id BIGSERIAL PRIMARY KEY,
+                    job_id INTEGER REFERENCES repair_jobs(job_id)
+                        ON DELETE CASCADE,
+                    chunk_hash VARCHAR(64) NOT NULL,
+                    mode TEXT NOT NULL,
+                    target_node TEXT NOT NULL,
+                    bytes_read BIGINT NOT NULL,
+                    bytes_written BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
 
 
 # -------------------------
@@ -135,11 +196,13 @@ def list_nodes():
             cur.execute("""
                 SELECT node_id, free_space, chunk_count,
                        last_seen,
-                       (last_seen > NOW() - INTERVAL '15 seconds')
-                           AS online
+                       (last_seen > NOW() - make_interval(secs => %s))
+                           AS online,
+                       EXTRACT(EPOCH FROM NOW() - last_seen)::int
+                           AS seconds_since_heartbeat
                 FROM storage_nodes
                 ORDER BY node_id
-            """)
+            """, (HEARTBEAT_TIMEOUT,))
             return cur.fetchall()
 
 
@@ -477,6 +540,8 @@ def repair_candidates():
                     AND o.version = oc.version
                 WHERE c.ref_count > 0
                   AND o.tags->>'redundancy' = 'replication'
+                  -- skip uploads still registering their locations
+                  AND o.created_at < NOW() - INTERVAL '30 seconds'
                 ORDER BY c.chunk_hash
             """)
             return cur.fetchall()
@@ -541,3 +606,174 @@ def unregister_chunk_location(chunk_hash: str, node_id: str):
             deleted = cur.rowcount
 
     return {"deleted": deleted > 0}
+
+
+# -------------------------
+# Erasure-coded shards (repair worker)
+# -------------------------
+
+@app.get("/erasure/chunks")
+def erasure_chunks():
+    """
+    Every distinct erasure-coded chunk with the current placement of
+    its shards, for scrubbing and repair.
+    """
+    with connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT oc.chunk_hash, c.size, e.padlen,
+                       e.shard_index, e.shard_hash,
+                       e.shard_size, e.node_id
+                FROM erasure_shards e
+                JOIN object_chunks oc
+                  ON oc.bucket = e.bucket
+                 AND oc.object_key = e.object_key
+                 AND oc.version = e.version
+                 AND oc.position = e.position
+                JOIN chunks c ON c.chunk_hash = oc.chunk_hash
+                JOIN objects o
+                  ON o.bucket = e.bucket
+                 AND o.object_key = e.object_key
+                 AND o.version = e.version
+                WHERE c.ref_count > 0
+                  AND o.created_at < NOW() - INTERVAL '30 seconds'
+                ORDER BY oc.chunk_hash, e.shard_index
+            """)
+            rows = cur.fetchall()
+
+    chunks = {}
+    for row in rows:
+        chunk = chunks.setdefault(row["chunk_hash"], {
+            "chunk_hash": row["chunk_hash"],
+            "size": row["size"],
+            "padlen": row["padlen"],
+            "shards": []
+        })
+        chunk["shards"].append({
+            "shard_index": row["shard_index"],
+            "shard_hash": row["shard_hash"],
+            "shard_size": row["shard_size"],
+            "node_id": row["node_id"]
+        })
+
+    return list(chunks.values())
+
+
+class ShardRelocation(BaseModel):
+    shard_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    old_node: str = Field(min_length=1)
+    new_node: str = Field(min_length=1)
+
+
+@app.post("/erasure/shards/relocate")
+def relocate_shard(data: ShardRelocation):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE erasure_shards
+                SET node_id = %s
+                WHERE shard_hash = %s AND node_id = %s
+            """, (data.new_node, data.shard_hash, data.old_node))
+            updated = cur.rowcount
+
+    return {"updated_rows": updated}
+
+
+# -------------------------
+# Repair jobs (progress + repair traffic)
+# -------------------------
+
+class RepairJobRequest(BaseModel):
+    reason: str = Field(min_length=1)
+    failed_nodes: list[str] = Field(default_factory=list)
+    chunks_total: int = Field(ge=0)
+
+
+class RepairJobUpdate(BaseModel):
+    status: str | None = Field(
+        default=None, pattern="^(running|completed|partial)$"
+    )
+    chunks_repaired: int = Field(default=0, ge=0)
+    chunks_failed: int = Field(default=0, ge=0)
+
+
+class RepairEvent(BaseModel):
+    chunk_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mode: str = Field(pattern="^(replication|erasure)$")
+    target_node: str
+    bytes_read: int = Field(ge=0)
+    bytes_written: int = Field(ge=0)
+
+
+@app.post("/repair-jobs", status_code=201)
+def create_repair_job(data: RepairJobRequest):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO repair_jobs
+                    (reason, failed_nodes, chunks_total)
+                VALUES (%s, %s, %s)
+                RETURNING job_id
+            """, (data.reason, data.failed_nodes, data.chunks_total))
+            job_id = cur.fetchone()[0]
+
+    return {"job_id": job_id}
+
+
+@app.patch("/repair-jobs/{job_id}")
+def update_repair_job(job_id: int, data: RepairJobUpdate):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE repair_jobs SET
+                    chunks_repaired = chunks_repaired + %s,
+                    chunks_failed = chunks_failed + %s,
+                    status = COALESCE(%s, status),
+                    finished_at = CASE WHEN %s IS NULL
+                                       THEN finished_at ELSE NOW() END
+                WHERE job_id = %s
+            """, (
+                data.chunks_repaired, data.chunks_failed,
+                data.status,
+                None if data.status in (None, "running") else data.status,
+                job_id
+            ))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Repair job not found")
+
+    return {"job_id": job_id}
+
+
+@app.post("/repair-jobs/{job_id}/events", status_code=201)
+def add_repair_event(job_id: int, data: RepairEvent):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO repair_events
+                    (job_id, chunk_hash, mode, target_node,
+                     bytes_read, bytes_written)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                job_id, data.chunk_hash, data.mode,
+                data.target_node, data.bytes_read, data.bytes_written
+            ))
+            cur.execute("""
+                UPDATE repair_jobs SET
+                    bytes_read = bytes_read + %s,
+                    bytes_written = bytes_written + %s
+                WHERE job_id = %s
+            """, (data.bytes_read, data.bytes_written, job_id))
+
+    return {"job_id": job_id}
+
+
+@app.get("/repair-jobs")
+def list_repair_jobs(limit: int = Query(default=20, ge=1, le=200)):
+    with connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM repair_jobs
+                ORDER BY job_id DESC
+                LIMIT %s
+            """, (limit,))
+            return cur.fetchall()

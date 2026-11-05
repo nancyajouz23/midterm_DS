@@ -35,17 +35,19 @@ from gateway.search_index import (
 METADATA_URL = os.getenv("METADATA_URL", "http://metadata:8010")
 DATABASE_URL = os.environ["DATABASE_URL"]
 API_KEY = os.environ["API_KEY"]
-RATE_LIMIT = 60
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "60"))  # requests/min per key
+NODE_COUNT = int(os.getenv("STORAGE_NODE_COUNT", "7"))
 
 N = 3
 W = 2
 R = 2
 K = 4
 M = 2
+EC_WRITE_QUORUM = K + 1  # accept an EC write if at least 5 of 6 shards land
 
 NODES = {
     f"node{i}": f"http://storage-node-{i}:8000"
-    for i in range(1, 7)
+    for i in range(1, NODE_COUNT + 1)
 }
 
 ring = ConsistentHashRing(sorted(NODES), virtual_nodes=128)
@@ -70,26 +72,6 @@ async def lifespan(app):
                     bucket TEXT PRIMARY KEY REFERENCES buckets(name),
                     mode TEXT NOT NULL
                         CHECK (mode IN ('replication', 'erasure'))
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS erasure_shards (
-                    bucket TEXT NOT NULL,
-                    object_key TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    position INTEGER NOT NULL,
-                    shard_index INTEGER NOT NULL,
-                    node_id TEXT NOT NULL,
-                    shard_hash VARCHAR(64) NOT NULL,
-                    shard_size BIGINT NOT NULL,
-                    padlen INTEGER NOT NULL,
-                    PRIMARY KEY (
-                        bucket, object_key, version,
-                        position, shard_index
-                    ),
-                    FOREIGN KEY (bucket, object_key, version)
-                        REFERENCES objects(bucket, object_key, version)
-                        ON DELETE CASCADE
                 )
             """)
     yield
@@ -198,8 +180,32 @@ def get_mode(bucket):
     return row[0]
 
 
-def write_replicas(client, chunk_hash, data):
-    targets = ring.get_nodes(chunk_hash, N)
+def online_nodes(client):
+    """Nodes with a recent heartbeat; all nodes if metadata is unreachable."""
+    try:
+        r = client.get(f"{METADATA_URL}/nodes")
+        r.raise_for_status()
+        online = {n["node_id"] for n in r.json() if n["online"]}
+        return online & set(NODES) or set(NODES)
+    except httpx.HTTPError:
+        return set(NODES)
+
+
+def placement(chunk_hash, count, online):
+    """
+    Walk the consistent hashing ring clockwise from the chunk hash and
+    take the first `count` distinct live nodes. Failed nodes are skipped
+    (and only used as a last resort), so a single failure does not block
+    writes.
+    """
+    order = ring.get_nodes(chunk_hash, len(NODES))
+    live = [n for n in order if n in online]
+    dead = [n for n in order if n not in online]
+    return (live + dead)[:count]
+
+
+def write_replicas(client, chunk_hash, data, online):
+    targets = placement(chunk_hash, N, online)
     successful = []
 
     for node in targets:
@@ -221,13 +227,15 @@ def write_replicas(client, chunk_hash, data):
     return successful
 
 
-def write_erasure(client, data):
+def write_erasure(client, chunk_hash, data, online):
     shard_data = encoder.encode(data)
     shard_rows = []
+    stored = 0
 
-    # Each shard goes to a different physical node.
-    for i, shard in enumerate(shard_data):
-        node = f"node{i + 1}"
+    # Each shard goes to a different physical node chosen by the ring.
+    targets = placement(chunk_hash, K + M, online)
+
+    for i, (shard, node) in enumerate(zip(shard_data, targets)):
         digest = hashlib.sha256(shard).hexdigest()
 
         try:
@@ -236,14 +244,19 @@ def write_erasure(client, data):
                 content=shard
             )
             r.raise_for_status()
+            stored += 1
         except httpx.HTTPError:
-            raise HTTPException(
-                503, f"Erasure shard upload failed on {node}"
-            )
+            pass  # recorded anyway; the repair worker rebuilds it
 
         shard_rows.append((
             i, node, digest, len(shard), (-len(data)) % K
         ))
+
+    if stored < EC_WRITE_QUORUM:
+        raise HTTPException(
+            503,
+            f"Erasure write quorum failed: {stored}/{EC_WRITE_QUORUM}"
+        )
 
     return shard_rows
 
@@ -255,6 +268,8 @@ def store_file(file_path, bucket, key, tags):
     ec_rows = []
 
     with httpx.Client(timeout=90) as client:
+        online = online_nodes(client)
+
         for position, (chunk_hash, data) in enumerate(
             fixed_size_chunks(file_path)
         ):
@@ -265,10 +280,12 @@ def store_file(file_path, bucket, key, tags):
 
             if mode == "replication":
                 placements[chunk_hash] = write_replicas(
-                    client, chunk_hash, data
+                    client, chunk_hash, data, online
                 )
             else:
-                for shard in write_erasure(client, data):
+                for shard in write_erasure(
+                    client, chunk_hash, data, online
+                ):
                     ec_rows.append((position, *shard))
 
         info = metadata_request(
@@ -725,6 +742,9 @@ def list_objects(bucket: str | None = None, prefix: str = ""):
 def cluster_status():
     with httpx.Client(timeout=15) as client:
         nodes = metadata_request(client, "GET", "/nodes")
+        repair_jobs = metadata_request(
+            client, "GET", "/repair-jobs", params={"limit": 10}
+        )
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -783,7 +803,114 @@ def cluster_status():
         ),
         "degraded_objects": len(degraded),
         "inaccessible_objects": len(inaccessible),
-        "repair_worker": "see repair-worker logs"
+        "repair_jobs": repair_jobs
+    }
+
+
+@router.get("/buckets/{bucket}/stats")
+def bucket_stats(bucket: str):
+    """
+    Storage cost of a bucket: logical bytes stored by users versus the
+    physical bytes kept on the storage nodes (replicas or shards).
+    """
+    mode = get_mode(bucket)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*), COALESCE(SUM(size), 0)
+                FROM objects WHERE bucket = %s
+            """, (bucket,))
+            objects, logical = cur.fetchone()
+
+            # Unique chunks after deduplication.
+            cur.execute("""
+                SELECT COUNT(*), COALESCE(SUM(c.size), 0)
+                FROM chunks c
+                WHERE c.chunk_hash IN (
+                    SELECT chunk_hash FROM object_chunks
+                    WHERE bucket = %s
+                )
+            """, (bucket,))
+            unique_chunks, unique_bytes = cur.fetchone()
+
+            if mode == "replication":
+                cur.execute("""
+                    SELECT COUNT(*),
+                           COALESCE(SUM(c.size), 0),
+                           COALESCE(SUM(CEIL(c.size / 4096.0) * 4096), 0)
+                    FROM chunk_locations cl
+                    JOIN chunks c ON c.chunk_hash = cl.chunk_hash
+                    WHERE cl.chunk_hash IN (
+                        SELECT chunk_hash FROM object_chunks
+                        WHERE bucket = %s
+                    )
+                """, (bucket,))
+            else:
+                cur.execute("""
+                    SELECT COUNT(*),
+                           COALESCE(SUM(shard_size), 0),
+                           COALESCE(SUM(CEIL(shard_size / 4096.0) * 4096), 0)
+                    FROM (
+                        SELECT DISTINCT shard_hash, node_id, shard_size
+                        FROM erasure_shards WHERE bucket = %s
+                    ) s
+                """, (bucket,))
+            stored_copies, physical, physical_blocks = cur.fetchone()
+
+    def ratio(a, b):
+        return round(float(a) / float(b), 3) if b else None
+
+    return {
+        "bucket": bucket,
+        "mode": mode,
+        "objects": objects,
+        "logical_bytes": int(logical),
+        "unique_chunks": unique_chunks,
+        "unique_chunk_bytes": int(unique_bytes),
+        "stored_copies": stored_copies,
+        "physical_bytes": int(physical),
+        "physical_bytes_4k_blocks": int(physical_blocks),
+        "storage_overhead": ratio(physical, unique_bytes),
+        "storage_overhead_4k_blocks": ratio(physical_blocks, unique_bytes)
+    }
+
+
+@router.get("/buckets/{bucket}/repair-traffic")
+def bucket_repair_traffic(bucket: str, since: str | None = None):
+    """Network traffic the repair worker spent on this bucket's chunks."""
+    mode = get_mode(bucket)
+    sql = """
+        SELECT COUNT(*), COUNT(DISTINCT e.chunk_hash),
+               COALESCE(SUM(e.bytes_read), 0),
+               COALESCE(SUM(e.bytes_written), 0)
+        FROM repair_events e
+        WHERE e.mode = %s
+          AND e.chunk_hash IN (
+            SELECT chunk_hash FROM object_chunks WHERE bucket = %s
+        )
+    """
+    values = [mode, bucket]
+    if since:
+        sql += " AND e.created_at >= %s::timestamptz"
+        values.append(since)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, values)
+                copies, chunks, read, written = cur.fetchone()
+    except psycopg2.Error:
+        raise HTTPException(400, "Invalid 'since' timestamp")
+
+    return {
+        "bucket": bucket,
+        "mode": mode,
+        "repaired_copies": copies,
+        "repaired_chunks": chunks,
+        "bytes_read": int(read),
+        "bytes_written": int(written),
+        "repair_traffic_bytes": int(read) + int(written)
     }
 
 

@@ -38,6 +38,7 @@ services:
     environment:
       METADATA_URL: http://metadata:8010
       REPAIR_INTERVAL: "10"
+      STORAGE_NODE_COUNT: "7"
     depends_on:
       - metadata
     restart: unless-stopped
@@ -71,6 +72,24 @@ services:
       METADATA_URL: http://metadata:8010
     volumes:
       - node6-data:/data
+    depends_on:
+      - metadata
+
+  # 7th node: erasure coding uses 6 shards (4+2), so a spare node is
+  # needed to rebuild a shard when one of the 6 holders fails.
+  storage-node-7:
+    build:
+      context: .
+      dockerfile: storage_node/Dockerfile
+    container_name: storage-node-7
+    ports:
+      - "8007:8000"
+    environment:
+      NODE_ID: node7
+      STORAGE_DIR: /data
+      METADATA_URL: http://metadata:8010
+    volumes:
+      - node7-data:/data
     depends_on:
       - metadata
 
@@ -174,6 +193,8 @@ services:
       METADATA_URL: http://metadata:8010
       DATABASE_URL: postgresql://ds_user:${POSTGRES_PASSWORD}@postgres:5432/ds_storage
       API_KEY: ${GATEWAY_API_KEY}
+      RATE_LIMIT: ${GATEWAY_RATE_LIMIT:-60}
+      STORAGE_NODE_COUNT: "7"
       ELASTICSEARCH_URL: http://elasticsearch:9200
     depends_on:
       - metadata
@@ -205,5 +226,7 @@ volumes:
   node6-data:
     external: true
     name: ds-midterm-node6-data
+
+  node7-data:
 
   elasticsearch-data:

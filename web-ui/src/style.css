@@ -206,7 +206,7 @@ th, td {
 th { color: #7c899f; font-weight: 700; }
 .file-name { display: flex; align-items: center; gap: 9px; font-weight: 600; }
 .file-name svg { color: #6680e8; }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .icon-button { padding: 8px; background: #edf1fa; color: #425eaa; }
 .icon-button.danger { background: #fff0f0; color: #d24f4f; }
 .empty { text-align: center; color: #8c99ad; padding: 35px; }
@@ -262,3 +262,21 @@ th { color: #7c899f; font-weight: 700; }
   .connection { flex-wrap: wrap; }
   .form-grid { grid-template-columns: 1fr; }
 }
+
+/* Repair progress (cluster tab) */
+.status.running { background: #fff4d6; color: #a46a00; }
+.progress.large { height: 14px; }
+.repair-current {
+  border: 1px solid #e3e8f0;
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin: 12px 0 18px;
+}
+label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-weight: 600;
+}
+label.inline input { width: auto; margin: 0; }

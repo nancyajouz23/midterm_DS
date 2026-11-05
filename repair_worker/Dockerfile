@@ -3,7 +3,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir httpx
+RUN pip install --no-cache-dir httpx zfec
 
 COPY metadata_service /app/metadata_service
 COPY repair_worker /app/repair_worker

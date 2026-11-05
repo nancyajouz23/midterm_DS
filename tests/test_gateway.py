@@ -170,7 +170,7 @@ def test_04_cluster_status(client):
 # Garbage collection: physical deletion of chunks
 # -------------------------------------------------
 
-NODE_PORTS = {f"node{i}": 8000 + i for i in range(1, 7)}
+NODE_PORTS = {f"node{i}": 8000 + i for i in range(1, 8)}
 
 
 def nodes_holding(digest):
