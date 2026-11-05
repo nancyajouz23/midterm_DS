@@ -482,6 +482,51 @@ def repair_candidates():
             return cur.fetchall()
 
 
+@app.delete("/chunks/{chunk_hash}")
+def purge_chunk(chunk_hash: str):
+    """
+    Garbage-collect a chunk whose reference count reached zero.
+
+    The row is removed only if no object references it any more
+    (ref_count = 0). Its location records are returned so the caller
+    can delete the physical copies from the storage nodes.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", chunk_hash):
+        raise HTTPException(400, "Invalid SHA-256 hash")
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ref_count FROM chunks
+                WHERE chunk_hash = %s
+                FOR UPDATE
+            """, (chunk_hash,))
+            row = cur.fetchone()
+
+            if row is None:
+                return {"chunk_hash": chunk_hash, "purged": False,
+                        "reason": "not registered", "nodes": []}
+
+            if row[0] > 0:
+                return {"chunk_hash": chunk_hash, "purged": False,
+                        "reason": "still referenced", "nodes": []}
+
+            cur.execute("""
+                SELECT node_id FROM chunk_locations
+                WHERE chunk_hash = %s
+                ORDER BY node_id
+            """, (chunk_hash,))
+            nodes = [r[0] for r in cur.fetchall()]
+
+            # chunk_locations rows are removed by ON DELETE CASCADE.
+            cur.execute(
+                "DELETE FROM chunks WHERE chunk_hash = %s AND ref_count = 0",
+                (chunk_hash,)
+            )
+
+    return {"chunk_hash": chunk_hash, "purged": True, "nodes": nodes}
+
+
 @app.delete("/chunks/locations/{chunk_hash}/{node_id}")
 def unregister_chunk_location(chunk_hash: str, node_id: str):
     if not re.fullmatch(r"[0-9a-f]{64}", chunk_hash):

@@ -558,15 +558,99 @@ def download_object(
     )
 
 
+def object_erasure_shards(bucket, key, version):
+    """Shard rows of one object version: (position, node_id, shard_hash)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT position, node_id, shard_hash
+                FROM erasure_shards
+                WHERE bucket=%s AND object_key=%s AND version=%s
+            """, (bucket, key, version))
+            return cur.fetchall()
+
+
+def shard_still_referenced(shard_hash):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM erasure_shards WHERE shard_hash=%s LIMIT 1",
+                (shard_hash,)
+            )
+            return cur.fetchone() is not None
+
+
+def delete_from_node(client, node, digest):
+    """Physically delete a chunk/shard; a missing copy counts as deleted."""
+    try:
+        r = client.delete(f"{NODES[node]}/chunks/{digest}")
+        return r.status_code in (200, 404)
+    except httpx.HTTPError:
+        return False
+
+
+def garbage_collect(client, obj, orphaned, shard_rows):
+    """
+    Remove chunks whose reference count reached zero from the storage
+    nodes. Chunks still referenced by another object (deduplication)
+    are never touched.
+    """
+    chunk_at = {
+        position: chunk["hash"]
+        for position, chunk in enumerate(obj["chunks"])
+    }
+    deleted = []
+    failed = []
+
+    for chunk_hash in orphaned:
+        purge = metadata_request(
+            client, "DELETE", f"/chunks/{chunk_hash}"
+        )
+        if not purge["purged"]:
+            continue  # re-referenced by a concurrent upload
+
+        # Replicated copies: delete on every node, so stale copies left
+        # behind by repairs are removed too.
+        for node in NODES:
+            if delete_from_node(client, node, chunk_hash):
+                deleted.append((node, chunk_hash))
+            else:
+                failed.append((node, chunk_hash))
+
+        # Erasure-coded shards of this chunk.
+        for position, node, shard_hash in shard_rows:
+            if chunk_at.get(position) != chunk_hash:
+                continue
+            if shard_still_referenced(shard_hash):
+                continue
+            if delete_from_node(client, node, shard_hash):
+                deleted.append((node, shard_hash))
+            else:
+                failed.append((node, shard_hash))
+
+    for node, digest in failed:
+        print(
+            f"GC pending: could not delete {digest[:12]} on {node}",
+            flush=True
+        )
+
+    return len(failed)
+
+
 @router.delete("/objects/{bucket}/{key:path}")
 def delete_object(bucket: str, key: str, version: int | None = None):
     obj = get_object(bucket, key, version)
+    # Read shard placement before the metadata rows cascade away.
+    shard_rows = object_erasure_shards(bucket, key, obj["version"])
 
     with httpx.Client(timeout=30) as client:
         result = metadata_request(
             client, "DELETE",
             f"/objects/metadata/{bucket}/{key}"
             f"/versions/{obj['version']}"
+        )
+        gc_failures = garbage_collect(
+            client, obj, result["unreferenced_chunks"], shard_rows
         )
     try:
         remove_object(bucket, key, obj["version"])
@@ -576,7 +660,9 @@ def delete_object(bucket: str, key: str, version: int | None = None):
     return {
         "deleted": True,
         "version": obj["version"],
-        "unreferenced_chunks": result["unreferenced_chunks"]
+        "unreferenced_chunks": result["unreferenced_chunks"],
+        "purged_chunks": len(result["unreferenced_chunks"]),
+        "gc_failures": gc_failures
     }
 
 

@@ -1,4 +1,5 @@
 
+import hashlib
 import os
 import uuid
 
@@ -163,3 +164,68 @@ def test_04_cluster_status(client):
     assert "degraded_objects" in data
 
     assert data["online_nodes"] >= 4
+
+
+# -------------------------------------------------
+# Garbage collection: physical deletion of chunks
+# -------------------------------------------------
+
+NODE_PORTS = {f"node{i}": 8000 + i for i in range(1, 7)}
+
+
+def nodes_holding(digest):
+    """Storage nodes that still physically hold a chunk/shard."""
+    holders = []
+    for node, port in NODE_PORTS.items():
+        r = httpx.head(
+            f"http://localhost:{port}/chunks/{digest}", timeout=10
+        )
+        if r.status_code == 200:
+            holders.append(node)
+    return holders
+
+
+def erasure_shard_hashes(chunk_data):
+    from zfec.easyfec import Encoder
+    return [
+        hashlib.sha256(shard).hexdigest()
+        for shard in Encoder(4, 6).encode(chunk_data)
+    ]
+
+
+@pytest.mark.parametrize("mode", ["replication", "erasure"])
+def test_05_chunks_deleted_only_when_unreferenced(client, mode):
+    bucket = f"pytest-gc-{mode}-{uuid.uuid4().hex[:8]}"
+    data = os.urandom(64 * 1024 + 11)
+    digest = hashlib.sha256(data).hexdigest()
+
+    assert client.post(
+        "/buckets", json={"name": bucket, "mode": mode}
+    ).status_code == 201
+
+    # Two objects with identical content share one deduplicated chunk.
+    for key in ("a.bin", "b.bin"):
+        assert client.put(
+            f"/objects/{bucket}/{key}", content=data
+        ).status_code == 201
+
+    if mode == "replication":
+        stored = [digest]
+    else:
+        stored = erasure_shard_hashes(data)
+
+    assert all(nodes_holding(h) for h in stored)
+
+    # First delete: chunk is still referenced by b.bin -> kept.
+    response = client.delete(f"/objects/{bucket}/a.bin")
+    assert response.status_code == 200
+    assert response.json()["unreferenced_chunks"] == []
+    assert all(nodes_holding(h) for h in stored)
+    assert client.get(f"/objects/{bucket}/b.bin").content == data
+
+    # Last reference removed -> chunk physically deleted everywhere.
+    response = client.delete(f"/objects/{bucket}/b.bin")
+    assert response.status_code == 200
+    assert response.json()["unreferenced_chunks"] == [digest]
+    assert response.json()["gc_failures"] == 0
+    assert all(nodes_holding(h) == [] for h in stored)
