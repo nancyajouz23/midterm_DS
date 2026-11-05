@@ -1,0 +1,79 @@
+# Gateway: Deployment behind a Service (the Service load-balances
+# across the pods) with a HorizontalPodAutoscaler that adds pods when
+# CPU usage rises.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: ds-storage
+spec:
+  type: LoadBalancer        # Docker Desktop: localhost:8030; cloud: public IP
+  selector: {app: gateway}
+  ports:
+    - {name: http, port: 8030, targetPort: 8020}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: ds-storage
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: gateway}
+  template:
+    metadata:
+      labels: {app: gateway}
+    spec:
+      containers:
+        - name: gateway
+          image: ds-storage/gateway:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: METADATA_URL, value: "http://metadata:8010"}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: ds-secrets, key: POSTGRES_PASSWORD}}
+            - name: DATABASE_URL
+              value: postgresql://ds_user:$(POSTGRES_PASSWORD)@postgres:5432/ds_storage
+            - name: API_KEY
+              valueFrom: {secretKeyRef: {name: ds-secrets, key: GATEWAY_API_KEY}}
+            - {name: RATE_LIMIT, value: "600"}
+            - {name: ELASTICSEARCH_URL, value: "http://elasticsearch:9200"}
+            - name: RABBITMQ_PASSWORD
+              valueFrom: {secretKeyRef: {name: rabbitmq-secret, key: RABBITMQ_PASSWORD}}
+            - {name: RABBITMQ_URL, value: "amqp://ds:$(RABBITMQ_PASSWORD)@rabbitmq:5672/%2F"}
+          ports:
+            - containerPort: 8020
+          readinessProbe:
+            httpGet: {path: /health, port: 8020}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: 8020}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: ds-storage
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60

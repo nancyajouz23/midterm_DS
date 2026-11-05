@@ -1,0 +1,73 @@
+# Storage nodes as a StatefulSet:
+#  * stable names storage-node-0 ... storage-node-N and stable DNS
+#    (storage-node-3.storage-node) through the headless service,
+#  * one PersistentVolumeClaim per node (volumeClaimTemplates), kept
+#    when a pod is restarted or rescheduled,
+#  * liveness probe: a node that stops answering is restarted
+#    automatically; readiness probe: traffic only to ready nodes.
+#
+# Scale out (triggers rebalancing):
+#   kubectl -n ds-storage scale statefulset storage-node --replicas=8
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-node
+  namespace: ds-storage
+spec:
+  clusterIP: None          # headless: one DNS name per pod
+  publishNotReadyAddresses: true
+  selector: {app: storage-node}
+  ports:
+    - {name: http, port: 8000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: storage-node
+  namespace: ds-storage
+spec:
+  serviceName: storage-node
+  replicas: 7
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: storage-node}
+  template:
+    metadata:
+      labels: {app: storage-node}
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: storage-node
+          image: ds-storage/storage-node:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: NODE_ID, value: "$(POD_NAME)"}
+            - {name: NODE_URL, value: "http://$(POD_NAME).storage-node:8000"}
+            - {name: STORAGE_DIR, value: /data}
+            - {name: METADATA_URL, value: "http://metadata:8010"}
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 2Gi}

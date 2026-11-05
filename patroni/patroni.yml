@@ -1,0 +1,49 @@
+# Shared Patroni configuration. Per-member values come from environment
+# variables (PATRONI_NAME, PATRONI_*_CONNECT_ADDRESS, passwords, etcd
+# hosts) set in compose.storage.yaml.
+scope: ds-metadata
+namespace: /db/
+
+restapi:
+  listen: 0.0.0.0:8008
+
+etcd3:
+  hosts: etcd1:2379,etcd2:2379,etcd3:2379
+
+bootstrap:
+  dcs:
+    ttl: 30            # leader lease: a dead leader is replaced after ~30 s
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: "on"
+        max_connections: 200
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  pg_hba:
+    - local all all trust
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+  # Creates the application user and database once, on the first leader.
+  post_bootstrap: /usr/local/bin/post_bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/patroni/data
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    superuser:
+      username: postgres
+    replication:
+      username: replicator
+  parameters:
+    unix_socket_directories: /var/run/postgresql

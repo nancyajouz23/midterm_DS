@@ -1,4 +1,3 @@
-
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -9,9 +8,12 @@ RUN pip install --no-cache-dir \
     httpx \
     psycopg2-binary \
     zfec \
-    python-multipart
+    python-multipart \
+    pika \
+    prometheus-client
 
 COPY metadata_service /app/metadata_service
+COPY common /app/common
 COPY gateway /app/gateway
 
 EXPOSE 8020

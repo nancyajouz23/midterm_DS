@@ -1,0 +1,55 @@
+# Metadata database (single instance on Kubernetes; the replicated
+# Patroni + etcd cluster is used in the Docker Compose deployment).
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ds-storage
+spec:
+  selector: {app: postgres}
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ds-storage
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - {name: POSTGRES_DB, value: ds_storage}
+            - {name: POSTGRES_USER, value: ds_user}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: ds-secrets, key: POSTGRES_PASSWORD}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "ds_user", "-d", "ds_storage"]}
+            periodSeconds: 5
+          livenessProbe:
+            exec: {command: ["pg_isready", "-U", "ds_user", "-d", "ds_storage"]}
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}

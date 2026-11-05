@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import socket
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -20,11 +21,16 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
+from prometheus_client import (
+    CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+)
+from prometheus_client.core import GaugeMetricFamily, REGISTRY
 from pydantic import BaseModel, Field
 from zfec.easyfec import Encoder, Decoder
 
+from common import jobqueue
+from common.cluster import ClusterView
 from metadata_service.chunking import fixed_size_chunks
-from metadata_service.placement import ConsistentHashRing
 from gateway.search_index import (
     index_object,
     remove_object,
@@ -36,7 +42,7 @@ METADATA_URL = os.getenv("METADATA_URL", "http://metadata:8010")
 DATABASE_URL = os.environ["DATABASE_URL"]
 API_KEY = os.environ["API_KEY"]
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "60"))  # requests/min per key
-NODE_COUNT = int(os.getenv("STORAGE_NODE_COUNT", "7"))
+INSTANCE = socket.gethostname()  # which gateway replica answered
 
 N = 3
 W = 2
@@ -45,12 +51,9 @@ K = 4
 M = 2
 EC_WRITE_QUORUM = K + 1  # accept an EC write if at least 5 of 6 shards land
 
-NODES = {
-    f"node{i}": f"http://storage-node-{i}:8000"
-    for i in range(1, NODE_COUNT + 1)
-}
-
-ring = ConsistentHashRing(sorted(NODES), virtual_nodes=128)
+# Storage nodes are discovered from their heartbeats (id + URL), so a
+# node that joins is used for new writes automatically.
+view = ClusterView(METADATA_URL)
 encoder = Encoder(K, K + M)
 decoder = Decoder(K, K + M)
 
@@ -60,11 +63,10 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=5)
 
 
-@asynccontextmanager
-async def lifespan(app):
+def create_gateway_tables():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -74,6 +76,19 @@ async def lifespan(app):
                         CHECK (mode IN ('replication', 'erasure'))
                 )
             """)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # The metadata service creates the base tables and the database may
+    # still be electing a leader, so retry for a while.
+    for attempt in range(60):
+        try:
+            create_gateway_tables()
+            break
+        except psycopg2.Error as exc:
+            print(f"Database not ready ({exc}); retrying", flush=True)
+            await asyncio.sleep(2)
     yield
 
 
@@ -81,6 +96,80 @@ app = FastAPI(
     title="Distributed Object Storage Gateway",
     lifespan=lifespan
 )
+
+
+# -------------------------
+# Monitoring (Prometheus)
+# -------------------------
+
+REQUESTS = Counter(
+    "gateway_http_requests", "HTTP requests handled",
+    ["method", "route", "status"]
+)
+LATENCY = Histogram(
+    "gateway_http_request_seconds", "HTTP request latency",
+    ["method", "route"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30)
+)
+UPLOADED_BYTES = Counter("gateway_uploaded_bytes", "Object bytes uploaded")
+DOWNLOADED_BYTES = Counter(
+    "gateway_downloaded_bytes", "Object bytes downloaded"
+)
+
+
+@app.middleware("http")
+async def observe(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    # Route template (e.g. /objects/{bucket}/{key:path}) keeps the
+    # number of label values small.
+    route = getattr(request.scope.get("route"), "path", "unmatched")
+    if route != "/metrics":
+        LATENCY.labels(request.method, route).observe(
+            time.perf_counter() - start
+        )
+        REQUESTS.labels(
+            request.method, route, str(response.status_code)
+        ).inc()
+    response.headers["X-Served-By"] = INSTANCE
+    return response
+
+
+class ClusterCollector:
+    """Degraded objects and node counts, cached for 10 s."""
+
+    def __init__(self):
+        self.cached_at = 0.0
+        self.status = None
+        self.lock = Lock()
+
+    def collect(self):
+        with self.lock:
+            if time.monotonic() - self.cached_at > 10:
+                try:
+                    self.status = cluster_status()
+                except Exception:
+                    self.status = None
+                self.cached_at = time.monotonic()
+            status = self.status
+        if not status:
+            return
+        for name, doc, value in (
+            ("storage_degraded_objects",
+             "Objects with fewer copies/shards than configured",
+             status["degraded_objects"]),
+            ("storage_inaccessible_objects",
+             "Objects that cannot be read", status["inaccessible_objects"]),
+        ):
+            yield GaugeMetricFamily(name, doc, value=value)
+
+
+REGISTRY.register(ClusterCollector())
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 
 def authorize(key=Depends(api_key_header)):
@@ -180,38 +269,16 @@ def get_mode(bucket):
     return row[0]
 
 
-def online_nodes(client):
-    """Nodes with a recent heartbeat; all nodes if metadata is unreachable."""
-    try:
-        r = client.get(f"{METADATA_URL}/nodes")
-        r.raise_for_status()
-        online = {n["node_id"] for n in r.json() if n["online"]}
-        return online & set(NODES) or set(NODES)
-    except httpx.HTTPError:
-        return set(NODES)
-
-
-def placement(chunk_hash, count, online):
-    """
-    Walk the consistent hashing ring clockwise from the chunk hash and
-    take the first `count` distinct live nodes. Failed nodes are skipped
-    (and only used as a last resort), so a single failure does not block
-    writes.
-    """
-    order = ring.get_nodes(chunk_hash, len(NODES))
-    live = [n for n in order if n in online]
-    dead = [n for n in order if n not in online]
-    return (live + dead)[:count]
-
-
-def write_replicas(client, chunk_hash, data, online):
-    targets = placement(chunk_hash, N, online)
+def write_replicas(client, chunk_hash, data, nodes):
+    # Walk the consistent hashing ring clockwise from the chunk hash and
+    # take the first N live nodes (failed nodes only as a last resort).
+    targets = nodes.placement(chunk_hash, N)
     successful = []
 
     for node in targets:
         try:
             r = client.put(
-                f"{NODES[node]}/chunks/{chunk_hash}",
+                f"{nodes.url(node)}/chunks/{chunk_hash}",
                 content=data
             )
             r.raise_for_status()
@@ -227,20 +294,20 @@ def write_replicas(client, chunk_hash, data, online):
     return successful
 
 
-def write_erasure(client, chunk_hash, data, online):
+def write_erasure(client, chunk_hash, data, nodes):
     shard_data = encoder.encode(data)
     shard_rows = []
     stored = 0
 
     # Each shard goes to a different physical node chosen by the ring.
-    targets = placement(chunk_hash, K + M, online)
+    targets = nodes.placement(chunk_hash, K + M)
 
     for i, (shard, node) in enumerate(zip(shard_data, targets)):
         digest = hashlib.sha256(shard).hexdigest()
 
         try:
             r = client.put(
-                f"{NODES[node]}/chunks/{digest}",
+                f"{nodes.url(node)}/chunks/{digest}",
                 content=shard
             )
             r.raise_for_status()
@@ -268,7 +335,7 @@ def store_file(file_path, bucket, key, tags):
     ec_rows = []
 
     with httpx.Client(timeout=90) as client:
-        online = online_nodes(client)
+        nodes = view.refresh(client)
 
         for position, (chunk_hash, data) in enumerate(
             fixed_size_chunks(file_path)
@@ -277,14 +344,15 @@ def store_file(file_path, bucket, key, tags):
                 "hash": chunk_hash,
                 "size": len(data)
             })
+            UPLOADED_BYTES.inc(len(data))
 
             if mode == "replication":
                 placements[chunk_hash] = write_replicas(
-                    client, chunk_hash, data, online
+                    client, chunk_hash, data, nodes
                 )
             else:
                 for shard in write_erasure(
-                    client, chunk_hash, data, online
+                    client, chunk_hash, data, nodes
                 ):
                     ec_rows.append((position, *shard))
 
@@ -408,11 +476,13 @@ def read_replicated_chunk(client, digest, size):
     valid = []
     data = None
 
+    nodes = view.refresh(client)
     for node in locations:
-        if node not in NODES:
+        url = nodes.url(node)
+        if url is None:
             continue
         try:
-            r = client.get(f"{NODES[node]}/chunks/{digest}")
+            r = client.get(f"{url}/chunks/{digest}")
             r.raise_for_status()
 
             if (
@@ -448,9 +518,13 @@ def read_erasure_chunk(client, obj, position, digest, size):
     blocks = []
     indices = []
 
+    nodes = view.refresh(client)
     for index, node, shard_hash, shard_size, padlen in rows:
+        url = nodes.url(node)
+        if url is None:
+            continue
         try:
-            r = client.get(f"{NODES[node]}/chunks/{shard_hash}")
+            r = client.get(f"{url}/chunks/{shard_hash}")
             r.raise_for_status()
             if (
                 len(r.content) != shard_size
@@ -499,6 +573,7 @@ def chunk_stream(obj, start, end):
 
             left = max(0, start - chunk_start)
             right = min(len(data), end - chunk_start + 1)
+            DOWNLOADED_BYTES.inc(right - left)
             yield data[left:right]
 
 
@@ -599,10 +674,45 @@ def shard_still_referenced(shard_hash):
 
 def delete_from_node(client, node, digest):
     """Physically delete a chunk/shard; a missing copy counts as deleted."""
+    url = view.url(node)
+    if url is None:
+        return False
     try:
-        r = client.delete(f"{NODES[node]}/chunks/{digest}")
+        r = client.delete(f"{url}/chunks/{digest}")
         return r.status_code in (200, 404)
     except httpx.HTTPError:
+        return False
+
+
+def orphan_shards(obj, orphaned, shard_rows):
+    """Erasure shards (node, shard_hash) of each unreferenced chunk."""
+    chunk_at = {
+        position: chunk["hash"]
+        for position, chunk in enumerate(obj["chunks"])
+    }
+    shards = {chunk_hash: [] for chunk_hash in orphaned}
+    for position, node, shard_hash in shard_rows:
+        if chunk_at.get(position) in shards:
+            shards[chunk_at[position]].append([node, shard_hash])
+    return shards
+
+
+def queue_garbage_collection(obj, orphaned, shard_rows):
+    """
+    Hand the physical deletion to the queue workers (storage.gc).
+    Returns False if RabbitMQ is not available.
+    """
+    if not orphaned or not jobqueue.RABBITMQ_URL:
+        return not orphaned
+    shards = orphan_shards(obj, orphaned, shard_rows)
+    try:
+        jobqueue.publish_once("gc", [
+            {"chunk_hash": chunk_hash, "shards": shards[chunk_hash]}
+            for chunk_hash in orphaned
+        ])
+        return True
+    except Exception as exc:
+        print(f"GC queue unavailable ({exc}); deleting inline", flush=True)
         return False
 
 
@@ -610,7 +720,7 @@ def garbage_collect(client, obj, orphaned, shard_rows):
     """
     Remove chunks whose reference count reached zero from the storage
     nodes. Chunks still referenced by another object (deduplication)
-    are never touched.
+    are never touched. Used when the job queue is unavailable.
     """
     chunk_at = {
         position: chunk["hash"]
@@ -618,6 +728,7 @@ def garbage_collect(client, obj, orphaned, shard_rows):
     }
     deleted = []
     failed = []
+    view.refresh(client)
 
     for chunk_hash in orphaned:
         purge = metadata_request(
@@ -628,7 +739,7 @@ def garbage_collect(client, obj, orphaned, shard_rows):
 
         # Replicated copies: delete on every node, so stale copies left
         # behind by repairs are removed too.
-        for node in NODES:
+        for node in view.registered:
             if delete_from_node(client, node, chunk_hash):
                 deleted.append((node, chunk_hash))
             else:
@@ -666,9 +777,15 @@ def delete_object(bucket: str, key: str, version: int | None = None):
             f"/objects/metadata/{bucket}/{key}"
             f"/versions/{obj['version']}"
         )
-        gc_failures = garbage_collect(
-            client, obj, result["unreferenced_chunks"], shard_rows
-        )
+        orphaned = result["unreferenced_chunks"]
+
+        # Normally the deletion is queued for the workers; if RabbitMQ
+        # is down the gateway deletes the chunks itself.
+        if queue_garbage_collection(obj, orphaned, shard_rows):
+            gc_mode, gc_failures = "queued", 0
+        else:
+            gc_mode = "inline"
+            gc_failures = garbage_collect(client, obj, orphaned, shard_rows)
     try:
         remove_object(bucket, key, obj["version"])
     except Exception as exc:
@@ -677,8 +794,9 @@ def delete_object(bucket: str, key: str, version: int | None = None):
     return {
         "deleted": True,
         "version": obj["version"],
-        "unreferenced_chunks": result["unreferenced_chunks"],
-        "purged_chunks": len(result["unreferenced_chunks"]),
+        "unreferenced_chunks": orphaned,
+        "purged_chunks": len(orphaned),
+        "gc": gc_mode,
         "gc_failures": gc_failures
     }
 
@@ -885,7 +1003,9 @@ def bucket_repair_traffic(bucket: str, since: str | None = None):
                COALESCE(SUM(e.bytes_read), 0),
                COALESCE(SUM(e.bytes_written), 0)
         FROM repair_events e
+        JOIN repair_jobs j ON j.job_id = e.job_id
         WHERE e.mode = %s
+          AND j.job_type = 'repair'  -- not rebalancing traffic
           AND e.chunk_hash IN (
             SELECT chunk_hash FROM object_chunks WHERE bucket = %s
         )
@@ -916,7 +1036,7 @@ def bucket_repair_traffic(bucket: str, since: str | None = None):
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "gateway"}
+    return {"status": "healthy", "service": "gateway", "instance": INSTANCE}
 
 
 @router.post("/search/reindex")

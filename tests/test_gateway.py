@@ -1,13 +1,14 @@
 
 import hashlib
 import os
+import time
 import uuid
 
 import httpx
 import pytest
 
 
-BASE_URL = "http://localhost:8020"
+BASE_URL = os.getenv("GATEWAY_URL", "http://localhost:8020")
 API_KEY = os.environ["GATEWAY_API_KEY"]
 
 HEADERS = {
@@ -170,16 +171,19 @@ def test_04_cluster_status(client):
 # Garbage collection: physical deletion of chunks
 # -------------------------------------------------
 
-NODE_PORTS = {f"node{i}": 8000 + i for i in range(1, 8)}
+NODE_PORTS = {f"node{i}": 8000 + i for i in range(1, 9)}  # node8 optional
 
 
 def nodes_holding(digest):
     """Storage nodes that still physically hold a chunk/shard."""
     holders = []
     for node, port in NODE_PORTS.items():
-        r = httpx.head(
-            f"http://localhost:{port}/chunks/{digest}", timeout=10
-        )
+        try:
+            r = httpx.head(
+                f"http://localhost:{port}/chunks/{digest}", timeout=10
+            )
+        except httpx.TransportError:
+            continue  # node not running
         if r.status_code == 200:
             holders.append(node)
     return holders
@@ -224,8 +228,15 @@ def test_05_chunks_deleted_only_when_unreferenced(client, mode):
     assert client.get(f"/objects/{bucket}/b.bin").content == data
 
     # Last reference removed -> chunk physically deleted everywhere.
+    # The deletion is queued (RabbitMQ storage.gc) and done by a
+    # worker, so wait for it.
     response = client.delete(f"/objects/{bucket}/b.bin")
     assert response.status_code == 200
     assert response.json()["unreferenced_chunks"] == [digest]
+    assert response.json()["gc"] in ("queued", "inline")
     assert response.json()["gc_failures"] == 0
-    assert all(nodes_holding(h) == [] for h in stored)
+
+    deadline = time.monotonic() + 30
+    while any(nodes_holding(h) for h in stored):
+        assert time.monotonic() < deadline, "chunk not garbage-collected"
+        time.sleep(1)

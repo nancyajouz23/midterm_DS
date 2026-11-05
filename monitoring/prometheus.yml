@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  # Both gateway instances behind the load balancer.
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway-1:8020", "gateway-2:8020"]
+
+  - job_name: metadata
+    static_configs:
+      - targets: ["metadata:8010"]
+
+  # Storage nodes are discovered from the metadata service, so a node
+  # that joins the cluster is monitored automatically.
+  - job_name: storage-nodes
+    honor_labels: true
+    http_sd_configs:
+      - url: http://metadata:8010/prometheus/targets
+        refresh_interval: 15s
+
+  - job_name: repair-scheduler
+    static_configs:
+      - targets: ["repair-scheduler:9100"]
+
+  # All worker replicas (Docker DNS returns one address per replica).
+  - job_name: repair-workers
+    dns_sd_configs:
+      - names: ["repair-worker"]
+        type: A
+        port: 9100
+        refresh_interval: 15s
+
+  - job_name: rabbitmq
+    metrics_path: /metrics/per-object
+    static_configs:
+      - targets: ["rabbitmq:15692"]

@@ -1,11 +1,16 @@
 
 import os
 import re
+import time
 from collections import Counter
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client.core import (
+    CollectorRegistry, CounterMetricFamily, GaugeMetricFamily
+)
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Distributed Storage Metadata Service")
@@ -18,7 +23,7 @@ HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "15"))
 
 
 def connect():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=5)
 
 
 # -------------------------
@@ -27,6 +32,19 @@ def connect():
 
 @app.on_event("startup")
 def initialize_database():
+    # The database may still be electing a leader (replicated
+    # PostgreSQL), so retry for a while instead of crashing.
+    for attempt in range(60):
+        try:
+            create_schema()
+            return
+        except psycopg2.Error as exc:
+            print(f"Database not ready ({exc}); retrying", flush=True)
+            time.sleep(2)
+    create_schema()
+
+
+def create_schema():
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -36,6 +54,18 @@ def initialize_database():
                     chunk_count INTEGER NOT NULL,
                     last_seen TIMESTAMPTZ DEFAULT NOW()
                 )
+            """)
+            # url: where the node can be reached (sent in heartbeats),
+            # so nodes can join without changing any configuration.
+            # rebalanced: FALSE for a node that just joined until the
+            # scheduler has moved its share of the data onto it.
+            cur.execute("""
+                ALTER TABLE storage_nodes
+                    ADD COLUMN IF NOT EXISTS url TEXT,
+                    ADD COLUMN IF NOT EXISTS first_seen
+                        TIMESTAMPTZ DEFAULT NOW(),
+                    ADD COLUMN IF NOT EXISTS rebalanced
+                        BOOLEAN NOT NULL DEFAULT TRUE
             """)
 
             cur.execute("""
@@ -133,6 +163,12 @@ def initialize_database():
                     finished_at TIMESTAMPTZ
                 )
             """)
+            # repair (failure / scrub) or rebalance (node joined).
+            cur.execute("""
+                ALTER TABLE repair_jobs
+                    ADD COLUMN IF NOT EXISTS job_type
+                        TEXT NOT NULL DEFAULT 'repair'
+            """)
 
             # Per-chunk repair traffic, used to compare replication
             # and erasure coding per bucket.
@@ -160,6 +196,7 @@ class Heartbeat(BaseModel):
     node_id: str
     free_space: int = Field(ge=0)
     chunk_count: int = Field(ge=0)
+    url: str | None = None
 
 
 @app.get("/health")
@@ -171,31 +208,36 @@ def health():
 def receive_heartbeat(data: Heartbeat):
     with connect() as conn:
         with conn.cursor() as cur:
+            # A node seen for the first time starts with
+            # rebalanced = FALSE, which makes the scheduler move its
+            # share of the existing data onto it.
             cur.execute("""
                 INSERT INTO storage_nodes
-                    (node_id, free_space, chunk_count, last_seen)
-                VALUES (%s, %s, %s, NOW())
+                    (node_id, free_space, chunk_count, last_seen,
+                     url, first_seen, rebalanced)
+                VALUES (%s, %s, %s, NOW(), %s, NOW(), FALSE)
                 ON CONFLICT (node_id)
                 DO UPDATE SET
                     free_space = EXCLUDED.free_space,
                     chunk_count = EXCLUDED.chunk_count,
+                    url = COALESCE(EXCLUDED.url, storage_nodes.url),
                     last_seen = NOW()
             """, (
                 data.node_id,
                 data.free_space,
-                data.chunk_count
+                data.chunk_count,
+                data.url
             ))
 
     return {"message": "Heartbeat received", "node_id": data.node_id}
 
 
-@app.get("/nodes")
-def list_nodes():
+def fetch_nodes():
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT node_id, free_space, chunk_count,
-                       last_seen,
+                SELECT node_id, url, free_space, chunk_count,
+                       last_seen, first_seen, rebalanced,
                        (last_seen > NOW() - make_interval(secs => %s))
                            AS online,
                        EXTRACT(EPOCH FROM NOW() - last_seen)::int
@@ -204,6 +246,25 @@ def list_nodes():
                 ORDER BY node_id
             """, (HEARTBEAT_TIMEOUT,))
             return cur.fetchall()
+
+
+@app.get("/nodes")
+def list_nodes():
+    return fetch_nodes()
+
+
+@app.post("/nodes/{node_id}/rebalanced")
+def mark_node_rebalanced(node_id: str):
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE storage_nodes SET rebalanced = TRUE "
+                "WHERE node_id = %s",
+                (node_id,)
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Unknown node")
+    return {"node_id": node_id, "rebalanced": True}
 
 
 # -------------------------
@@ -547,6 +608,54 @@ def repair_candidates():
             return cur.fetchall()
 
 
+@app.get("/chunks/placements")
+def replicated_placements(
+    nodes: list[str] | None = Query(default=None),
+    chunk_hash: str | None = None
+):
+    """
+    Replicated chunks with the nodes holding their copies.
+    nodes=...      only chunks with a copy on one of these nodes
+                   (used when those nodes failed),
+    chunk_hash=... a single chunk (fresh state for a worker).
+    """
+    sql = """
+        SELECT c.chunk_hash, c.size,
+               COALESCE(
+                   array_agg(cl.node_id ORDER BY cl.node_id)
+                       FILTER (WHERE cl.node_id IS NOT NULL),
+                   '{}'
+               ) AS nodes
+        FROM chunks c
+        LEFT JOIN chunk_locations cl ON cl.chunk_hash = c.chunk_hash
+        WHERE c.ref_count > 0
+          AND EXISTS (
+              SELECT 1 FROM object_chunks oc
+              JOIN objects o
+                ON o.bucket = oc.bucket
+               AND o.object_key = oc.object_key
+               AND o.version = oc.version
+              WHERE oc.chunk_hash = c.chunk_hash
+                AND o.tags->>'redundancy' = 'replication'
+                AND (%s OR o.created_at < NOW() - INTERVAL '30 seconds')
+          )
+    """
+    values = [chunk_hash is not None]
+    if chunk_hash:
+        sql += " AND c.chunk_hash = %s"
+        values.append(chunk_hash)
+    sql += " GROUP BY c.chunk_hash, c.size"
+    if nodes:
+        sql += " HAVING bool_or(cl.node_id = ANY(%s))"
+        values.append(nodes)
+    sql += " ORDER BY c.chunk_hash"
+
+    with connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, values)
+            return cur.fetchall()
+
+
 @app.delete("/chunks/{chunk_hash}")
 def purge_chunk(chunk_hash: str):
     """
@@ -613,32 +722,45 @@ def unregister_chunk_location(chunk_hash: str, node_id: str):
 # -------------------------
 
 @app.get("/erasure/chunks")
-def erasure_chunks():
+def erasure_chunks(
+    nodes: list[str] | None = Query(default=None),
+    chunk_hash: str | None = None
+):
     """
     Every distinct erasure-coded chunk with the current placement of
-    its shards, for scrubbing and repair.
+    its shards, for scrubbing, repair and rebalancing.
+    nodes=...      only chunks with a shard on one of these nodes,
+    chunk_hash=... a single chunk (fresh state for a worker).
     """
+    sql = """
+        SELECT DISTINCT oc.chunk_hash, c.size, e.padlen,
+               e.shard_index, e.shard_hash,
+               e.shard_size, e.node_id
+        FROM erasure_shards e
+        JOIN object_chunks oc
+          ON oc.bucket = e.bucket
+         AND oc.object_key = e.object_key
+         AND oc.version = e.version
+         AND oc.position = e.position
+        JOIN chunks c ON c.chunk_hash = oc.chunk_hash
+        JOIN objects o
+          ON o.bucket = e.bucket
+         AND o.object_key = e.object_key
+         AND o.version = e.version
+        WHERE c.ref_count > 0
+    """
+    values = []
+    if chunk_hash:
+        sql += " AND oc.chunk_hash = %s"
+        values.append(chunk_hash)
+    else:
+        # skip uploads that are still being registered
+        sql += " AND o.created_at < NOW() - INTERVAL '30 seconds'"
+    sql += " ORDER BY oc.chunk_hash, e.shard_index"
+
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT DISTINCT oc.chunk_hash, c.size, e.padlen,
-                       e.shard_index, e.shard_hash,
-                       e.shard_size, e.node_id
-                FROM erasure_shards e
-                JOIN object_chunks oc
-                  ON oc.bucket = e.bucket
-                 AND oc.object_key = e.object_key
-                 AND oc.version = e.version
-                 AND oc.position = e.position
-                JOIN chunks c ON c.chunk_hash = oc.chunk_hash
-                JOIN objects o
-                  ON o.bucket = e.bucket
-                 AND o.object_key = e.object_key
-                 AND o.version = e.version
-                WHERE c.ref_count > 0
-                  AND o.created_at < NOW() - INTERVAL '30 seconds'
-                ORDER BY oc.chunk_hash, e.shard_index
-            """)
+            cur.execute(sql, values)
             rows = cur.fetchall()
 
     chunks = {}
@@ -656,7 +778,14 @@ def erasure_chunks():
             "node_id": row["node_id"]
         })
 
-    return list(chunks.values())
+    result = list(chunks.values())
+    if nodes:
+        wanted = set(nodes)
+        result = [
+            chunk for chunk in result
+            if any(s["node_id"] in wanted for s in chunk["shards"])
+        ]
+    return result
 
 
 class ShardRelocation(BaseModel):
@@ -687,6 +816,7 @@ class RepairJobRequest(BaseModel):
     reason: str = Field(min_length=1)
     failed_nodes: list[str] = Field(default_factory=list)
     chunks_total: int = Field(ge=0)
+    job_type: str = Field(default="repair", pattern="^(repair|rebalance)$")
 
 
 class RepairJobUpdate(BaseModel):
@@ -711,10 +841,13 @@ def create_repair_job(data: RepairJobRequest):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO repair_jobs
-                    (reason, failed_nodes, chunks_total)
-                VALUES (%s, %s, %s)
+                    (reason, failed_nodes, chunks_total, job_type)
+                VALUES (%s, %s, %s, %s)
                 RETURNING job_id
-            """, (data.reason, data.failed_nodes, data.chunks_total))
+            """, (
+                data.reason, data.failed_nodes,
+                data.chunks_total, data.job_type
+            ))
             job_id = cur.fetchone()[0]
 
     return {"job_id": job_id}
@@ -741,7 +874,21 @@ def update_repair_job(job_id: int, data: RepairJobUpdate):
             if cur.rowcount == 0:
                 raise HTTPException(404, "Repair job not found")
 
-    return {"job_id": job_id}
+            # Jobs are processed by several queue workers in parallel;
+            # whichever worker finishes the last chunk closes the job.
+            cur.execute("""
+                UPDATE repair_jobs SET
+                    status = CASE WHEN chunks_failed > 0
+                                  THEN 'partial' ELSE 'completed' END,
+                    finished_at = NOW()
+                WHERE job_id = %s
+                  AND status = 'running'
+                  AND chunks_repaired + chunks_failed >= chunks_total
+                RETURNING status
+            """, (job_id,))
+            closed = cur.fetchone()
+
+    return {"job_id": job_id, "closed": closed[0] if closed else None}
 
 
 @app.post("/repair-jobs/{job_id}/events", status_code=201)
@@ -768,12 +915,119 @@ def add_repair_event(job_id: int, data: RepairEvent):
 
 
 @app.get("/repair-jobs")
-def list_repair_jobs(limit: int = Query(default=20, ge=1, le=200)):
+def list_repair_jobs(
+    limit: int = Query(default=20, ge=1, le=200),
+    status: str | None = None
+):
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT * FROM repair_jobs
-                ORDER BY job_id DESC
-                LIMIT %s
-            """, (limit,))
+            if status:
+                cur.execute("""
+                    SELECT * FROM repair_jobs WHERE status = %s
+                    ORDER BY job_id DESC LIMIT %s
+                """, (status, limit))
+            else:
+                cur.execute("""
+                    SELECT * FROM repair_jobs
+                    ORDER BY job_id DESC
+                    LIMIT %s
+                """, (limit,))
             return cur.fetchall()
+
+
+# -------------------------
+# Monitoring (Prometheus)
+# -------------------------
+
+@app.get("/prometheus/targets")
+def prometheus_targets():
+    """
+    Prometheus HTTP service discovery: every registered storage node,
+    so a node that joins is scraped automatically.
+    """
+    targets = []
+    for node in fetch_nodes():
+        if not node["url"]:
+            continue
+        address = node["url"].split("://", 1)[-1].rstrip("/")
+        targets.append({
+            "targets": [address],
+            "labels": {"node_id": node["node_id"]}
+        })
+    return targets
+
+
+class StorageCollector:
+    """Cluster-wide metrics read from the metadata database."""
+
+    def collect(self):
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT job_type,
+                           COALESCE(SUM(chunks_repaired), 0),
+                           COALESCE(SUM(chunks_failed), 0),
+                           COALESCE(SUM(bytes_read + bytes_written), 0),
+                           COUNT(*) FILTER (WHERE status = 'running')
+                    FROM repair_jobs GROUP BY job_type
+                """)
+                jobs = cur.fetchall()
+
+                cur.execute("SELECT COUNT(*), COALESCE(SUM(size), 0) "
+                            "FROM objects")
+                objects, logical = cur.fetchone()
+                cur.execute("SELECT COUNT(*) FROM chunks "
+                            "WHERE ref_count > 0")
+                (chunks,) = cur.fetchone()
+
+        nodes = fetch_nodes()
+
+        chunks_done = CounterMetricFamily(
+            "storage_jobs_chunks",
+            "Chunks processed by repair/rebalance jobs",
+            labels=["job_type", "result"]
+        )
+        traffic = CounterMetricFamily(
+            "storage_jobs_traffic_bytes",
+            "Bytes read + written by repair/rebalance jobs",
+            labels=["job_type"]
+        )
+        running = GaugeMetricFamily(
+            "storage_jobs_running", "Jobs in progress", labels=["job_type"]
+        )
+        for job_type, repaired, failed, moved, active in jobs:
+            chunks_done.add_metric([job_type, "ok"], repaired)
+            chunks_done.add_metric([job_type, "failed"], failed)
+            traffic.add_metric([job_type], moved)
+            running.add_metric([job_type], active)
+
+        yield chunks_done
+        yield traffic
+        yield running
+        yield GaugeMetricFamily(
+            "storage_objects", "Stored object versions", value=objects
+        )
+        yield GaugeMetricFamily(
+            "storage_logical_bytes", "Bytes stored by users", value=logical
+        )
+        yield GaugeMetricFamily(
+            "storage_unique_chunks", "Chunks after deduplication",
+            value=chunks
+        )
+        yield GaugeMetricFamily(
+            "storage_nodes_online", "Nodes with a recent heartbeat",
+            value=sum(1 for n in nodes if n["online"])
+        )
+        yield GaugeMetricFamily(
+            "storage_nodes_registered", "Nodes that ever registered",
+            value=len(nodes)
+        )
+
+
+registry = CollectorRegistry()
+registry.register(StorageCollector())
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)

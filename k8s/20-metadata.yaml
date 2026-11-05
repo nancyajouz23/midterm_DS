@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: metadata
+  namespace: ds-storage
+spec:
+  selector: {app: metadata}
+  ports:
+    - port: 8010
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata
+  namespace: ds-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: metadata}
+  template:
+    metadata:
+      labels: {app: metadata}
+    spec:
+      containers:
+        - name: metadata
+          image: ds-storage/metadata:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: ds-secrets, key: POSTGRES_PASSWORD}}
+            - name: DATABASE_URL
+              value: postgresql://ds_user:$(POSTGRES_PASSWORD)@postgres:5432/ds_storage
+          ports:
+            - containerPort: 8010
+          readinessProbe:
+            httpGet: {path: /health, port: 8010}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: 8010}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
