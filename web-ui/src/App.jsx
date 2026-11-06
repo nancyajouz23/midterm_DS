@@ -17,6 +17,7 @@ export default function App() {
   const [file, setFile] = useState(null);
   const [objects, setObjects] = useState([]);
   const [cluster, setCluster] = useState(null);
+  const [searchBucket, setSearchBucket] = useState("");  // "" = all
   const [prefix, setPrefix] = useState("");
   const [minSize, setMinSize] = useState("");
   const [maxSize, setMaxSize] = useState("");
@@ -187,7 +188,7 @@ export default function App() {
 
     await execute(async () => {
       const query = new URLSearchParams();
-      if (bucket) query.set("bucket", bucket);
+      if (searchBucket) query.set("bucket", searchBucket);
       if (prefix) query.set("prefix", prefix);
       if (minSize) query.set("min_size", minSize);
       if (maxSize) query.set("max_size", maxSize);
@@ -435,7 +436,17 @@ export default function App() {
             <h2><Search size={20} /> Elasticsearch Metadata Search</h2>
             <form onSubmit={search}>
               <div className="form-grid">
-                <div style={{gridColumn: "1 / -1"}}>
+                <div>
+                  <label>Bucket</label>
+                  <select value={searchBucket}
+                    onChange={(e) => setSearchBucket(e.target.value)}>
+                    <option value="">All buckets</option>
+                    {buckets.map((b) => (
+                      <option key={b.name} value={b.name}>{b.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
                   <label>Key prefix</label>
                   <input value={prefix}
                     onChange={(e) => setPrefix(e.target.value)}
@@ -480,6 +491,7 @@ export default function App() {
                 </button>
                 <button type="button" className="secondary"
                   onClick={() => {
+                    setSearchBucket("");
                     setPrefix(""); setMinSize(""); setMaxSize("");
                     setCreatedAfter(""); setCreatedBefore("");
                     setTagKey(""); setTagValue(""); setResults([]);

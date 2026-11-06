@@ -54,7 +54,9 @@ class Scheduler:
         self.publisher = Publisher()
         self.known_failed = set()
         self.unrepairable = None  # work that failed last time
+        self.waiting_logged = None
         self.metadata_error_at = time.monotonic()  # grace period at start
+        self.grace_reason = "scheduler started"
 
     # ----- jobs -----
 
@@ -93,8 +95,10 @@ class Scheduler:
     def skip_unrepairable(self, ctx, items):
         key = (frozenset(ctx.online), frozenset(items))
         if key == self.unrepairable:
-            log(f"WAITING: {len(items)} chunks still degraded and cannot be "
-                "repaired until a node joins or recovers")
+            if self.waiting_logged != key:  # say it once, not every round
+                log(f"WAITING: {len(items)} chunks still degraded and cannot "
+                    "be repaired until a node joins or recovers")
+                self.waiting_logged = key
             return True
         return False
 
@@ -115,6 +119,7 @@ class Scheduler:
             # The node list could not be refreshed: metadata service or
             # its database is down. Decide nothing on stale data.
             self.metadata_error_at = time.monotonic()
+            self.grace_reason = "metadata was unavailable"
             log("METADATA UNAVAILABLE: skipping this round")
             return
         nodes = ctx.view.nodes
@@ -127,8 +132,8 @@ class Scheduler:
         if failed:
             since_outage = time.monotonic() - self.metadata_error_at
             if since_outage < FAILURE_GRACE:
-                log(f"GRACE PERIOD: metadata was unavailable "
-                    f"{int(since_outage)}s ago; waiting for heartbeats from "
+                log(f"GRACE PERIOD ({self.grace_reason} "
+                    f"{int(since_outage)}s ago): waiting for heartbeats from "
                     f"{sorted(failed)} before declaring failures")
                 return
             if len(failed) > len(registered) / 2:
@@ -200,7 +205,7 @@ class Scheduler:
         replicated = metadata(ctx, "GET", "/chunks/placements")
         erasure = metadata(ctx, "GET", "/erasure/chunks")
 
-        items = []
+        items, extra = [], []
         for chunk in replicated:
             state = core.inspect_replicated(
                 ctx, chunk["chunk_hash"], chunk["size"], chunk["nodes"]
@@ -211,6 +216,10 @@ class Scheduler:
             if corrupt or len(healthy) + len(waiting) + len(lost) \
                     < core.REPLICATION_FACTOR:
                 items.append(("replication", chunk["chunk_hash"]))
+            elif len(healthy) > core.REPLICATION_FACTOR \
+                    and not lost and not waiting:
+                # More than N healthy copies: the extras are removed.
+                extra.append(("replication", chunk["chunk_hash"]))
 
         for chunk in erasure:
             healthy, missing = core.inspect_erasure(ctx, chunk)
@@ -220,8 +229,9 @@ class Scheduler:
         SCRUB_SECONDS.set(time.perf_counter() - start)
         log(f"SCRUB COMPLETE: {len(replicated)} replicated + {len(erasure)} "
             f"erasure-coded chunks checked in "
-            f"{time.perf_counter() - start:.1f}s, {len(items)} damaged")
-        return items
+            f"{time.perf_counter() - start:.1f}s, {len(items)} damaged"
+            + (f", {len(extra)} with extra copies" if extra else ""))
+        return items, extra
 
 
 def main_loop(scheduler):
@@ -230,10 +240,13 @@ def main_loop(scheduler):
             with core.new_client() as client:
                 ctx = core.Context(client, force_refresh=True)
                 with schedule_lock:
-                    scheduler.tick(ctx)
+                    # Workers run the job asynchronously: look at the
+                    # result of the previous job before deciding the
+                    # next one, so work that failed is not queued again.
                     if getattr(scheduler, "last_job", None):
                         job_id, items = scheduler.last_job
                         scheduler.remember_result(ctx, job_id, items)
+                    scheduler.tick(ctx)
                 try:
                     for task, depth in scheduler.publisher.queue_depths().items():
                         QUEUE_DEPTH.labels(task).set(depth)
@@ -241,6 +254,7 @@ def main_loop(scheduler):
                     pass
         except Exception as exc:
             scheduler.metadata_error_at = time.monotonic()
+            scheduler.grace_reason = "metadata was unavailable"
             log(f"SCHEDULER ERROR: {exc}")
         time.sleep(INTERVAL)
 
@@ -253,18 +267,27 @@ def scrub_loop(scheduler):
                 ctx = core.Context(client, force_refresh=True)
                 if getattr(scheduler, "last_job", None):
                     scheduler.remember_result(ctx, *scheduler.last_job)
-                items = scheduler.scrub(ctx)
+                items, extra = scheduler.scrub(ctx)
                 if not items:
                     scheduler.unrepairable = None
+                if not items and not extra:
                     continue
                 with schedule_lock:
-                    if scheduler.active_job(ctx) or \
-                            scheduler.skip_unrepairable(ctx, items):
+                    if scheduler.active_job(ctx):
                         continue
-                    scheduler.last_job = (scheduler.queue_job(
-                        ctx, "repair", "repair",
-                        "scrub: corrupted or missing copies", items
-                    ), items)
+                    if items:
+                        if scheduler.skip_unrepairable(ctx, items):
+                            continue
+                        scheduler.last_job = (scheduler.queue_job(
+                            ctx, "repair", "repair",
+                            "scrub: corrupted or missing copies", items
+                        ), items)
+                    else:
+                        scheduler.queue_job(
+                            ctx, "rebalance", "rebalance",
+                            "scrub: chunks with more than "
+                            f"{core.REPLICATION_FACTOR} copies", extra
+                        )
         except Exception as exc:
             log(f"SCRUB ERROR: {exc}")
 

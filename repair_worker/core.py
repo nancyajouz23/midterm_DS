@@ -340,6 +340,31 @@ def repair_erasure(ctx, job, digest):
         if shard["state"] in ("corrupt", "missing"):
             delete_copy(ctx, shard["node_id"], shard["shard_hash"])
 
+    # Deduplication: objects that share this chunk may have been written
+    # with different shard layouts, so the same shard can be stored on
+    # several nodes. If an identical shard is still healthy on another
+    # node, point the lost location to it; nothing has to be rebuilt.
+    healthy_copy = {}
+    for shard in healthy:
+        healthy_copy.setdefault(shard["shard_hash"], shard["node_id"])
+    to_rebuild = []
+    for shard in missing:
+        node_id = healthy_copy.get(shard["shard_hash"])
+        if node_id is None:
+            to_rebuild.append(shard)
+            continue
+        metadata(ctx, "POST", "/erasure/shards/relocate", json={
+            "shard_hash": shard["shard_hash"],
+            "old_node": shard["node_id"],
+            "new_node": node_id
+        })
+        job.event(digest, "erasure", node_id, 0, 0)
+        log(f"[{WORKER_NAME}] RELINKED shard #{shard['shard_index']} of "
+            f"{digest[:12]} -> {node_id} (identical copy already there)")
+    missing = to_rebuild
+    if not missing:
+        return True
+
     original, bytes_read = decode_chunk(ctx, chunk, healthy)
     if original is None:
         log(f"[{WORKER_NAME}] REPAIR FAILED {digest[:12]}: fewer than "
@@ -424,6 +449,15 @@ def rebalance_replicated(ctx, job, digest):
     to_add = [n for n in desired if n not in healthy and ctx.alive(n)]
     to_remove = [n for n in healthy if n not in desired]
     if not to_add:
+        # Already on the assigned nodes: only extra copies (more than N,
+        # found by the scrub) are removed.
+        if len(healthy) - len(to_remove) >= REPLICATION_FACTOR:
+            for node_id in to_remove:
+                metadata(ctx, "DELETE",
+                         f"/chunks/locations/{digest}/{node_id}")
+                delete_copy(ctx, node_id, digest)
+                log(f"[{WORKER_NAME}] REMOVED extra replica {digest[:12]} "
+                    f"from {node_id}")
         return True
 
     source = None
@@ -444,10 +478,12 @@ def rebalance_replicated(ctx, job, digest):
         bytes_read = 0
         log(f"[{WORKER_NAME}] MOVED replica {digest[:12]} -> {node_id}")
 
-    # The new copies are in place: drop the ones no longer assigned.
-    for node_id in to_remove[:len(to_add)]:
-        metadata(ctx, "DELETE", f"/chunks/locations/{digest}/{node_id}")
-        delete_copy(ctx, node_id, digest)
+    # The new copies are in place: drop the ones no longer assigned,
+    # keeping exactly N copies (on the nodes the ring assigns).
+    if len(healthy) + len(to_add) - len(to_remove) >= REPLICATION_FACTOR:
+        for node_id in to_remove:
+            metadata(ctx, "DELETE", f"/chunks/locations/{digest}/{node_id}")
+            delete_copy(ctx, node_id, digest)
     return True
 
 

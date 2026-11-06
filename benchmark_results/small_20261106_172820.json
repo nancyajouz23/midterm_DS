@@ -1,0 +1,117 @@
+{
+  "workload": "small",
+  "date": "2026-11-06T17:26:52",
+  "files": 200,
+  "dataset_bytes": 4982180,
+  "workers": 16,
+  "seed": 77874953,
+  "buckets": {
+    "replication": "bench-small-rep-1106172652",
+    "erasure": "bench-small-era-1106172652"
+  },
+  "modes": {
+    "replication": {
+      "upload": {
+        "seconds": 5.63,
+        "throughput_MBps": 0.84,
+        "files_per_second": 35.53,
+        "latency_avg_ms": 441.3,
+        "latency_p95_ms": 563.4
+      },
+      "download": {
+        "seconds": 2.03,
+        "throughput_MBps": 2.34,
+        "files_per_second": 98.7,
+        "latency_avg_ms": 157.8,
+        "latency_p95_ms": 205.7,
+        "integrity_errors": 0
+      },
+      "storage": {
+        "bucket": "bench-small-rep-1106172652",
+        "mode": "replication",
+        "objects": 200,
+        "logical_bytes": 4982180,
+        "unique_chunks": 200,
+        "unique_chunk_bytes": 4982180,
+        "stored_copies": 600,
+        "physical_bytes": 14946540,
+        "physical_bytes_4k_blocks": 16072704,
+        "storage_overhead": 3.0,
+        "storage_overhead_4k_blocks": 3.226
+      }
+    },
+    "erasure": {
+      "upload": {
+        "seconds": 5.12,
+        "throughput_MBps": 0.93,
+        "files_per_second": 39.06,
+        "latency_avg_ms": 401.0,
+        "latency_p95_ms": 550.5
+      },
+      "download": {
+        "seconds": 2.52,
+        "throughput_MBps": 1.89,
+        "files_per_second": 79.44,
+        "latency_avg_ms": 192.2,
+        "latency_p95_ms": 282.7,
+        "integrity_errors": 0
+      },
+      "storage": {
+        "bucket": "bench-small-era-1106172652",
+        "mode": "erasure",
+        "objects": 200,
+        "logical_bytes": 4982180,
+        "unique_chunks": 200,
+        "unique_chunk_bytes": 4982180,
+        "stored_copies": 1200,
+        "physical_bytes": 7473726,
+        "physical_bytes_4k_blocks": 9977856,
+        "storage_overhead": 1.5,
+        "storage_overhead_4k_blocks": 2.003
+      }
+    }
+  },
+  "failure_test": {
+    "failed_node": "storage-node-2",
+    "detection_seconds": 12.5,
+    "repair_completed_seconds": 34.1,
+    "repair_jobs": [
+      {
+        "job_id": 101,
+        "reason": "node failure (missed heartbeats): node2",
+        "failed_nodes": [
+          "node2"
+        ],
+        "status": "completed",
+        "chunks_total": 224,
+        "chunks_repaired": 224,
+        "chunks_failed": 0,
+        "bytes_read": 5549295,
+        "bytes_written": 2775654,
+        "started_at": "2026-11-06T15:28:06.102560+00:00",
+        "finished_at": "2026-11-06T15:28:17.851646+00:00",
+        "job_type": "repair"
+      }
+    ],
+    "repair_traffic": {
+      "replication": {
+        "bucket": "bench-small-rep-1106172652",
+        "mode": "replication",
+        "repaired_copies": 77,
+        "repaired_chunks": 77,
+        "bytes_read": 1851107,
+        "bytes_written": 1851107,
+        "repair_traffic_bytes": 3702214
+      },
+      "erasure": {
+        "bucket": "bench-small-era-1106172652",
+        "mode": "erasure",
+        "repaired_copies": 147,
+        "repaired_chunks": 147,
+        "bytes_read": 3698188,
+        "bytes_written": 924547,
+        "repair_traffic_bytes": 4622735
+      }
+    }
+  }
+}

@@ -6,7 +6,9 @@ Workloads (from the midterm specification):
   large : a few large files (default 10 files of 100 MB, binary)
 
 For each workload and each redundancy mode the script:
-  1. generates the dataset (deterministic, reused on later runs),
+  1. generates the dataset from a seed (a new random seed each run, so
+     runs never share chunks through deduplication; --seed N repeats a
+     dataset),
   2. uploads every file through the gateway and measures throughput,
   3. downloads every file, verifies SHA-256 and measures throughput,
   4. reads the bucket's storage overhead (physical / logical bytes),
@@ -21,9 +23,9 @@ Usage (from the project folder, stack running):
   python -m scripts.workload_benchmark --workload large --failure-test
 
 Tip: the gateway allows 60 requests/minute per API key. For the small
-workload restart the gateway with a higher limit first, e.g.
+workload restart the gateways with a higher limit first, e.g.
   GATEWAY_RATE_LIMIT=1000000 docker compose -f compose.storage.yaml
-      --env-file .env up -d gateway
+      --env-file .env up -d gateway-1 gateway-2
 """
 
 import argparse
@@ -31,6 +33,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import statistics
 import subprocess
 import time
@@ -68,54 +71,72 @@ WORDS = (
 ).split()
 
 
-def generate_small(count, seed=42):
+def same_seed(marker, seed):
+    return marker.exists() and marker.read_text().strip() == str(seed)
+
+
+def generate_small(count, seed):
     """count text/JSON files of 1-50 KB."""
     folder = DATASETS / f"small_{count}"
-    if folder.exists() and len(list(folder.iterdir())) == count:
+    marker = DATASETS / f"small_{count}.seed"
+    if folder.exists() and len(list(folder.iterdir())) == count             and same_seed(marker, seed):
         return folder
 
-    folder.mkdir(parents=True, exist_ok=True)
+    if folder.exists():
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True)
     rnd = random.Random(seed)
 
     for i in range(count):
         target = rnd.randint(1024, 50 * 1024)
+        # The lengths are counted as the content grows (re-measuring the
+        # whole file at every step made generation quadratic and slow).
         if i % 2 == 0:
-            records = []
-            while len(json.dumps(records)) < target:
-                records.append({
+            records, length = [], 2  # "[]"
+            while length < target:
+                record = {
                     "id": rnd.randint(0, 10**9),
                     "name": " ".join(rnd.choices(WORDS, k=3)),
                     "value": rnd.random(),
                     "tags": rnd.sample(WORDS, 2)
-                })
+                }
+                length += len(json.dumps(record)) + (2 if records else 0)
+                records.append(record)
             data = json.dumps(records)[:target].encode()
             name = f"record_{i:05d}.json"
         else:
-            text = []
-            while sum(len(w) + 1 for w in text) < target:
-                text.append(rnd.choice(WORDS))
+            text, length = [], 0
+            while length < target:
+                word = rnd.choice(WORDS)
+                text.append(word)
+                length += len(word) + 1
             data = " ".join(text)[:target].encode()
             name = f"note_{i:05d}.txt"
 
         (folder / name).write_bytes(data)
 
+    marker.write_text(str(seed))
     return folder
 
 
-def generate_large(count, size_mb, seed=7):
+def generate_large(count, size_mb, seed):
     """count binary files of size_mb MB (incompressible, like video)."""
     folder = DATASETS / f"large_{count}x{size_mb}MB"
+    marker = DATASETS / f"large_{count}x{size_mb}MB.seed"
+    if folder.exists() and not same_seed(marker, seed):
+        shutil.rmtree(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    rnd = random.Random(seed)
 
     for i in range(count):
         path = folder / f"video_{i:02d}.bin"
         if path.exists() and path.stat().st_size == size_mb * MB:
             continue
+        rnd = random.Random(f"{seed}-{i}")  # each file on its own
         with path.open("wb") as file:
             for _ in range(size_mb):
                 file.write(rnd.randbytes(MB))
 
+    marker.write_text(str(seed))
     return folder
 
 
@@ -275,8 +296,8 @@ def write_report(result):
         f"# Workload benchmark: {result['workload']}",
         "",
         f"Dataset: {result['files']} files, "
-        f"{result['dataset_bytes'] / MB:.1f} MB total. "
-        f"Date: {result['date']}",
+        f"{result['dataset_bytes'] / MB:.1f} MB total, "
+        f"seed {result.get('seed')}. Date: {result['date']}",
         "",
         "| Metric | Replication (N=3) | Erasure coding (4+2) |",
         "|---|---|---|",
@@ -362,13 +383,20 @@ def main():
     parser.add_argument("--failure-test", action="store_true")
     parser.add_argument("--fail-node", default="storage-node-2")
     parser.add_argument("--repair-timeout", type=int, default=900)
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="dataset seed (default: a new random one, so the files are "
+             "new and nothing is deduplicated against earlier runs)"
+    )
     args = parser.parse_args()
+    seed = args.seed if args.seed is not None         else random.SystemRandom().randrange(10**9)
+    print(f"Dataset seed: {seed} (use --seed {seed} to repeat this run)")
 
     if args.workload == "small":
-        folder = generate_small(args.small_count)
+        folder = generate_small(args.small_count, seed)
         workers = args.workers or 16
     else:
-        folder = generate_large(args.large_count, args.large_size_mb)
+        folder = generate_large(args.large_count, args.large_size_mb, seed)
         workers = args.workers or 2
 
     files = sorted(folder.iterdir())
@@ -387,6 +415,7 @@ def main():
         "files": len(files),
         "dataset_bytes": total,
         "workers": workers,
+        "seed": seed,
         "buckets": buckets,
         "modes": {}
     }

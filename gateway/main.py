@@ -269,10 +269,55 @@ def get_mode(bucket):
     return row[0]
 
 
+def existing_replicas(client, chunk_hash, nodes):
+    """Live nodes that already hold a copy of this chunk (deduplication)."""
+    rows = metadata_request(
+        client, "GET", "/chunks/placements",
+        params={"chunk_hash": chunk_hash}
+    )
+    return [n for n in rows[0]["nodes"] if n in nodes.online] if rows else []
+
+
+def existing_shards(client, chunk_hash, nodes):
+    """
+    A complete set of shards of this chunk already stored on live nodes,
+    one shard per node (deduplication), or None.
+    """
+    rows = metadata_request(
+        client, "GET", "/erasure/chunks", params={"chunk_hash": chunk_hash}
+    )
+    if not rows:
+        return None
+    chosen, used = {}, set()
+    for shard in rows[0]["shards"]:
+        index, node = shard["shard_index"], shard["node_id"]
+        if index in chosen or node in used or node not in nodes.online:
+            continue
+        chosen[index] = shard
+        used.add(node)
+    if len(chosen) < K + M:
+        return None
+    return [
+        (index, s["node_id"], s["shard_hash"], s["shard_size"],
+         rows[0]["padlen"])
+        for index, s in sorted(chosen.items())
+    ]
+
+
 def write_replicas(client, chunk_hash, data, nodes):
+    # Deduplication: copies that already exist on live nodes are reused,
+    # only the missing ones are written. Without this, a chunk whose
+    # copies were moved by a repair would get extra copies on re-upload.
+    have = existing_replicas(client, chunk_hash, nodes)
+    if len(have) >= N:
+        return []
+
     # Walk the consistent hashing ring clockwise from the chunk hash and
-    # take the first N live nodes (failed nodes only as a last resort).
-    targets = nodes.placement(chunk_hash, N)
+    # take the first live nodes (failed nodes only as a last resort).
+    targets = [
+        n for n in nodes.placement(chunk_hash, len(nodes.registered))
+        if n not in have
+    ][:N - len(have)]
     successful = []
 
     for node in targets:
@@ -286,15 +331,21 @@ def write_replicas(client, chunk_hash, data, nodes):
         except httpx.HTTPError:
             pass
 
-    if len(successful) < W:
+    if len(have) + len(successful) < W:
         raise HTTPException(
-            503, f"Write quorum failed: {len(successful)}/{W}"
+            503, f"Write quorum failed: {len(have) + len(successful)}/{W}"
         )
 
     return successful
 
 
 def write_erasure(client, chunk_hash, data, nodes):
+    # Deduplication: reuse the shards of this chunk if a complete set is
+    # already stored, instead of writing a second set elsewhere.
+    reuse = existing_shards(client, chunk_hash, nodes)
+    if reuse:
+        return reuse
+
     shard_data = encoder.encode(data)
     shard_rows = []
     stored = 0

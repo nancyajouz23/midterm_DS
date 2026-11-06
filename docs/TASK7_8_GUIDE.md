@@ -3,7 +3,7 @@
 Run everything in **PowerShell** in the project folder. Start with:
 
 ```powershell
-docker compose -f compose.storage.yaml --env-file .env up -d --build
+docker compose -f compose.storage.yaml --env-file .env --profile scale-out up -d
 .\.venv\Scripts\Activate.ps1
 $key = (Select-String -Path .env -Pattern '^GATEWAY_API_KEY=').Line.Split('=',2)[1]; $h = @{"X-API-Key" = $key}; $env:GATEWAY_API_KEY = $key
 ```
